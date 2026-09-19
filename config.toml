@@ -1,0 +1,76 @@
+# 修改后需重新编译；本文件直接嵌入二进制，运行时不读取。
+[com.apple.finder]
+width = 860
+height = 660
+# x = 434
+# y = 218
+
+[com.tencent.xinWeChat]
+width = 900
+height = 729
+
+[com.apple.systempreferences]
+width = 740
+height = 648
+x = 494
+y = 223
+
+[com.apple.Safari]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[md.obsidian]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[com.openai.codex]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[com.lobehub.lobehub-desktop]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[org.blenderfoundation.blender]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[com.microsoft.Word]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[com.microsoft.Powerpoint]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[com.microsoft.Excel]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[com.navicat.NavicatPremium]
+width = 1712
+height = 1010
+x = 8
+y = 40
+
+[com.alibaba.DingTalkMac]
+width = 1712
+height = 1010
+x = 8
+y = 40

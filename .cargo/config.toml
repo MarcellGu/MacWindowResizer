@@ -1,0 +1,7 @@
+[alias]
+enable = "run --quiet --locked --bin task -- enable"
+disable = "run --quiet --locked --bin task -- disable"
+refresh = "run --quiet --locked --bin task -- refresh"
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"
