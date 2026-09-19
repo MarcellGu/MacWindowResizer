@@ -1,9 +1,9 @@
 //! Native window creation callbacks with config.toml embedded at compile time.
 
 use block2::RcBlock;
-use objc2::{MainThreadMarker, rc::Retained, runtime::ProtocolObject};
+use objc2::{MainThreadMarker, Message, rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace,
+    NSApplication, NSApplicationActivationPolicy, NSRunningApplication, NSScreen, NSWorkspace,
     NSWorkspaceApplicationKey, NSWorkspaceDidActivateApplicationNotification,
     NSWorkspaceDidLaunchApplicationNotification, NSWorkspaceDidTerminateApplicationNotification,
 };
@@ -12,10 +12,13 @@ use objc2_application_services::{
     AXValueType, kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFRetained, CFRunLoop, CFString, CFType, CGPoint, CGSize,
-    kCFRunLoopCommonModes,
+    CFArray, CFBoolean, CFDictionary, CFRetained, CFRunLoop, CFString, CFType, CGPoint, CGRect,
+    CGSize, kCFRunLoopCommonModes,
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol, NSOperationQueue};
+use objc2_foundation::{
+    NSNotification, NSNotificationCenter, NSObjectProtocol, NSOperationQueue, NSRunLoop,
+    NSRunLoopCommonModes, NSTimer,
+};
 use serde::Deserialize;
 use std::{
     cell::RefCell,
@@ -24,7 +27,7 @@ use std::{
     panic::AssertUnwindSafe,
     ptr::NonNull,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const EMBEDDED_CONFIG: &str = include_str!("../config.toml");
@@ -115,7 +118,7 @@ fn run(config: Config) -> Result<(), String> {
         let manager = state.as_mut().expect("manager initialized");
         manager.check_permission();
         for app in manager.workspace.runningApplications() {
-            manager.attach(&app);
+            manager.request_attach(&app, false);
         }
     });
     application.run();
@@ -129,6 +132,31 @@ struct Manager {
     center: Retained<NSNotificationCenter>,
     tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     observations: HashMap<i32, Observation>,
+    pending: HashMap<i32, PendingAttachment>,
+    retry_timer: Option<Retained<NSTimer>>,
+}
+
+struct PendingAttachment {
+    app: Retained<NSRunningApplication>,
+    recovery: StartupRecovery,
+}
+
+struct StartupRecovery {
+    launched: bool,
+    deadline: Instant,
+}
+
+impl StartupRecovery {
+    fn new(launched: bool, now: Instant) -> Self {
+        Self {
+            launched,
+            deadline: now + Duration::from_secs(5),
+        }
+    }
+
+    fn active(&self, now: Instant) -> bool {
+        now < self.deadline
+    }
 }
 
 impl Manager {
@@ -170,8 +198,9 @@ impl Manager {
                         };
                         if index == 2 {
                             manager.observations.remove(&app.processIdentifier());
+                            manager.pending.remove(&app.processIdentifier());
                         } else {
-                            manager.attach(app);
+                            manager.request_attach(app, index == 0);
                         }
                     });
                 }));
@@ -197,6 +226,8 @@ impl Manager {
             center,
             tokens,
             observations: HashMap::new(),
+            pending: HashMap::new(),
+            retry_timer: None,
         }
     }
 
@@ -213,35 +244,103 @@ impl Manager {
         }
     }
 
-    fn attach(&mut self, app: &NSRunningApplication) {
+    fn request_attach(&mut self, app: &NSRunningApplication, launched: bool) {
         let Some(bundle_id) = app.bundleIdentifier().map(|id| id.to_string()) else {
             return;
         };
-        let Some(rule) = self.config.get(&bundle_id) else {
-            return;
-        };
-        let pid = app.processIdentifier();
-        // SAFETY: Process-wide permission query; no prompting or memory arguments.
-        if app.isTerminated()
-            || self.observations.contains_key(&pid)
-            || !unsafe { AXIsProcessTrusted() }
-        {
+        if !self.config.contains_key(&bundle_id) || app.isTerminated() {
             return;
         }
-        match Observation::new(pid, rule.clone()) {
-            Ok(observation) => {
-                self.observations.insert(pid, observation);
-                eprintln!("MacWindowResizer: listening to {bundle_id} (pid {pid})");
+        let pid = app.processIdentifier();
+        if self.observations.contains_key(&pid) && !launched {
+            return;
+        }
+        // Activation must neither erase launch recovery nor extend its deadline.
+        self.pending
+            .entry(pid)
+            .and_modify(|pending| {
+                pending.recovery.launched |= launched;
+            })
+            .or_insert_with(|| PendingAttachment {
+                app: app.retain(),
+                recovery: StartupRecovery::new(launched, Instant::now()),
+            });
+        self.retry_pending();
+        if self.pending.is_empty() || self.retry_timer.is_some() {
+            return;
+        }
+        let block = RcBlock::new(|_: NonNull<NSTimer>| {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                MANAGER.with(|state| {
+                    if let Ok(mut state) = state.try_borrow_mut()
+                        && let Some(manager) = state.as_mut()
+                    {
+                        manager.retry_pending();
+                    }
+                });
+            }));
+            if result.is_err() {
+                eprintln!("MacWindowResizer: attachment retry callback panicked");
             }
-            Err(error) => eprintln!(
-                "MacWindowResizer: {bundle_id}: {error}; will retry on application activation"
-            ),
+        });
+        // SAFETY: The block captures nothing and is scheduled exclusively on the main
+        // run loop, which owns MANAGER. Drop invalidates the timer before teardown.
+        let timer = unsafe { NSTimer::timerWithTimeInterval_repeats_block(0.2, true, &block) };
+        unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
+        self.retry_timer = Some(timer);
+    }
+
+    fn retry_pending(&mut self) {
+        let pids: Vec<_> = self.pending.keys().copied().collect();
+        for pid in pids {
+            let pending = &self.pending[&pid];
+            if pending.app.isTerminated() || !pending.recovery.active(Instant::now()) {
+                if !pending.app.isTerminated() {
+                    eprintln!("MacWindowResizer: startup retry expired for pid {pid}");
+                }
+                self.pending.remove(&pid);
+                continue;
+            }
+            // SAFETY: Process-wide permission query without prompting.
+            if !unsafe { AXIsProcessTrusted() } {
+                continue;
+            }
+            if !self.observations.contains_key(&pid) {
+                let Some(bundle_id) = pending.app.bundleIdentifier().map(|id| id.to_string())
+                else {
+                    self.pending.remove(&pid);
+                    continue;
+                };
+                match Observation::new(pid, self.config[&bundle_id].clone()) {
+                    Ok(observation) => {
+                        self.observations.insert(pid, observation);
+                        eprintln!("MacWindowResizer: listening to {bundle_id} (pid {pid})");
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "MacWindowResizer: {bundle_id}: {error}; retrying during startup"
+                        );
+                        continue;
+                    }
+                }
+            }
+            if !pending.recovery.launched || self.observations[&pid].recover_startup_windows() {
+                self.pending.remove(&pid);
+            }
+        }
+        if self.pending.is_empty()
+            && let Some(timer) = self.retry_timer.take()
+        {
+            timer.invalidate();
         }
     }
 }
 
 impl Drop for Manager {
     fn drop(&mut self) {
+        if let Some(timer) = self.retry_timer.take() {
+            timer.invalidate();
+        }
         for token in &self.tokens {
             // SAFETY: Each token was returned by this notification center.
             unsafe { self.center.removeObserver((**token).as_ref()) };
@@ -316,6 +415,46 @@ impl Observation {
             run_loop,
         })
     }
+
+    fn recover_startup_windows(&self) -> bool {
+        // Register first, then enumerate: a window created in between is deduplicated
+        // against its queued AXWindowCreated event by the shared window registry.
+        let Ok(value) = attribute(&self.application, "AXWindows") else {
+            return false;
+        };
+        let Some(windows) = value.downcast_ref::<CFArray>() else {
+            return false;
+        };
+        // SAFETY: AXWindows is an array of retained CF objects. Downcast each
+        // element separately rather than assuming every object is an AXUIElement.
+        let windows = unsafe { &*(windows as *const CFArray).cast::<CFArray<CFType>>() };
+        let mut found = false;
+        for value in windows {
+            let Some(window) = value.downcast_ref::<AXUIElement>() else {
+                continue;
+            };
+            if !is_standard_window(window) {
+                continue;
+            }
+            self._context
+                .handle(&self.observer, window, "AXWindowCreated");
+            found |= self._context.is_main_window(window)
+                && self
+                    ._context
+                    .windows
+                    .borrow()
+                    .entries
+                    .iter()
+                    .any(|(entry, _)| &**entry == window);
+        }
+        if found {
+            eprintln!(
+                "MacWindowResizer: recovered startup windows for {}",
+                self._context.rule.bundle_id
+            );
+        }
+        found
+    }
 }
 
 impl Drop for Observation {
@@ -347,7 +486,7 @@ struct WindowContext {
     windows: RefCell<CreatedWindows<CFRetained<AXUIElement>>>,
 }
 
-// Track only windows created while listening, including those already handled.
+// Track creation events and windows recovered from an observed application launch.
 // Keeping handled windows until destruction prevents duplicate creation events
 // or later main-window changes from overwriting the user's manual resizing.
 struct CreatedWindows<T> {
@@ -357,6 +496,12 @@ struct CreatedWindows<T> {
 impl<T: PartialEq> CreatedWindows<T> {
     fn contains(&self, window: &T) -> bool {
         self.entries.iter().any(|(entry, _)| entry == window)
+    }
+
+    fn remember(&mut self, window: T) {
+        if !self.contains(&window) {
+            self.entries.push((window, false));
+        }
     }
 
     fn claim(&mut self, window: &T) -> bool {
@@ -381,10 +526,7 @@ impl WindowContext {
                 self.windows.borrow_mut().forget(&window);
                 return;
             }
-            "AXWindowCreated" => {
-                if self.windows.borrow().contains(&window) {
-                    return;
-                }
+            "AXWindowCreated" if !self.windows.borrow().contains(&window) => {
                 // SAFETY: Observation owns self until all notifications are removed.
                 let result = unsafe {
                     observer.add_notification(
@@ -400,12 +542,9 @@ impl WindowContext {
                     );
                     return;
                 }
-                self.windows
-                    .borrow_mut()
-                    .entries
-                    .push((window.clone(), false));
+                self.windows.borrow_mut().remember(window.clone());
             }
-            "AXMainWindowChanged" => {}
+            "AXWindowCreated" | "AXMainWindowChanged" => {}
             _ => return,
         }
         // Never claim existing windows or windows with an unknown main status.
@@ -421,17 +560,7 @@ impl WindowContext {
     }
 
     fn is_main_window(&self, window: &AXUIElement) -> bool {
-        if !boolean_attribute(window, "AXMain") {
-            return false;
-        }
-        attribute(window, "AXSubrole")
-            .ok()
-            .and_then(|value| {
-                value
-                    .downcast_ref::<CFString>()
-                    .map(|role| role.to_string())
-            })
-            .is_some_and(|role| role == "AXStandardWindow")
+        boolean_attribute(window, "AXMain") && is_standard_window(window)
     }
 
     fn apply(&self, window: &AXUIElement) {
@@ -441,8 +570,10 @@ impl WindowContext {
         if boolean_attribute(window, "AXFullScreen") || boolean_attribute(window, "AXMinimized") {
             return;
         }
-        // Capture position before resizing: some applications move a window during resize.
-        let old_position = point_attribute(window, "AXPosition");
+        // Move only as far as necessary before growing a window, otherwise AppKit
+        // can report success while clamping AXSize to the remaining screen space.
+        let position = point_attribute(window, "AXPosition")
+            .map(|position| resize_position(position, &self.rule));
         let mut size = CGSize::new(self.rule.width, self.rule.height);
         // SAFETY: size points to a correctly aligned CGSize for AXValueType::CGSize.
         let Some(size) =
@@ -461,6 +592,9 @@ impl WindowContext {
             {
                 break;
             }
+            if let Some(position) = position {
+                set_position(window, position, &self.rule.bundle_id);
+            }
             // SAFETY: AXSize accepts a CGSize wrapped in an AXValue; both references are live.
             let result =
                 unsafe { window.set_attribute_value(&CFString::from_str("AXSize"), &size) };
@@ -471,30 +605,25 @@ impl WindowContext {
                 );
                 continue;
             }
-            if let Some(mut position) = old_position {
-                position.x = self.rule.x.unwrap_or(position.x);
-                position.y = self.rule.y.unwrap_or(position.y);
-                if point_attribute(window, "AXPosition") != Some(position) {
-                    // SAFETY: position is a live CGPoint; AXPosition requires this value type.
-                    if let Some(value) = unsafe {
-                        AXValue::new(AXValueType::CGPoint, NonNull::from(&mut position).cast())
-                    } {
-                        let result = unsafe {
-                            window.set_attribute_value(&CFString::from_str("AXPosition"), &value)
-                        };
-                        if result != AXError::Success {
-                            eprintln!(
-                                "MacWindowResizer: {} position change failed: {}",
-                                self.rule.bundle_id, result.0
-                            );
-                        }
-                    }
-                }
+            if let Some(position) = position {
+                set_position(window, position, &self.rule.bundle_id);
             }
-            eprintln!(
-                "MacWindowResizer: applied {} × {} to {} window",
-                self.rule.width, self.rule.height, self.rule.bundle_id
-            );
+        }
+        match size_attribute(window) {
+            Some(actual) if actual == CGSize::new(self.rule.width, self.rule.height) => {
+                eprintln!(
+                    "MacWindowResizer: applied {} × {} to {} window",
+                    actual.width, actual.height, self.rule.bundle_id
+                );
+            }
+            Some(actual) => eprintln!(
+                "MacWindowResizer: {} requested {} × {}, actual {} × {}",
+                self.rule.bundle_id, self.rule.width, self.rule.height, actual.width, actual.height
+            ),
+            None => eprintln!(
+                "MacWindowResizer: {} could not verify window size",
+                self.rule.bundle_id
+            ),
         }
     }
 }
@@ -537,6 +666,17 @@ fn attribute(element: &AXUIElement, name: &str) -> Result<CFRetained<CFType>, AX
     Ok(unsafe { CFRetained::from_raw(raw) })
 }
 
+fn is_standard_window(window: &AXUIElement) -> bool {
+    attribute(window, "AXSubrole")
+        .ok()
+        .and_then(|value| {
+            value
+                .downcast_ref::<CFString>()
+                .map(|role| role.to_string())
+        })
+        .is_some_and(|role| role == "AXStandardWindow")
+}
+
 fn boolean_attribute(element: &AXUIElement, name: &str) -> bool {
     attribute(element, name)
         .ok()
@@ -550,6 +690,85 @@ fn point_attribute(element: &AXUIElement, name: &str) -> Option<CGPoint> {
     let mut point = CGPoint::new(0.0, 0.0);
     // SAFETY: We request a CGPoint and provide writable storage of that exact type.
     unsafe { value.value(AXValueType::CGPoint, NonNull::from(&mut point).cast()) }.then_some(point)
+}
+
+fn size_attribute(window: &AXUIElement) -> Option<CGSize> {
+    let value = attribute(window, "AXSize").ok()?;
+    let value = value.downcast_ref::<AXValue>()?;
+    let mut size = CGSize::new(0.0, 0.0);
+    // SAFETY: Writable CGSize storage matches the requested AXValue type.
+    unsafe { value.value(AXValueType::CGSize, NonNull::from(&mut size).cast()) }.then_some(size)
+}
+
+fn set_position(window: &AXUIElement, mut position: CGPoint, bundle_id: &str) {
+    if point_attribute(window, "AXPosition") == Some(position) {
+        return;
+    }
+    // SAFETY: AXPosition takes a CGPoint wrapped in an AXValue.
+    if let Some(value) =
+        unsafe { AXValue::new(AXValueType::CGPoint, NonNull::from(&mut position).cast()) }
+    {
+        let result =
+            unsafe { window.set_attribute_value(&CFString::from_str("AXPosition"), &value) };
+        if result != AXError::Success {
+            eprintln!(
+                "MacWindowResizer: {bundle_id} position change failed: {}",
+                result.0
+            );
+        }
+    }
+}
+
+fn fit_position(position: CGPoint, size: CGSize, visible: CGRect) -> CGPoint {
+    // Leave one logical point for the window border at the screen/Dock edges.
+    let left = visible.origin.x + 1.0;
+    let top = visible.origin.y + 1.0;
+    CGPoint::new(
+        position.x.clamp(
+            left,
+            (visible.origin.x + visible.size.width - size.width - 1.0).max(left),
+        ),
+        position.y.clamp(
+            top,
+            (visible.origin.y + visible.size.height - size.height - 1.0).max(top),
+        ),
+    )
+}
+
+fn resize_position(old: CGPoint, rule: &Rule) -> CGPoint {
+    let desired = CGPoint::new(rule.x.unwrap_or(old.x), rule.y.unwrap_or(old.y));
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return desired;
+    };
+    let screens = NSScreen::screens(main_thread);
+    let Some(primary) = screens.firstObject() else {
+        return desired;
+    };
+    // NSScreen uses bottom-left coordinates; AX uses the primary screen's top-left.
+    let primary_top = primary.frame().origin.y + primary.frame().size.height;
+    for screen in &screens {
+        let frame = screen.frame();
+        let top = primary_top - frame.origin.y - frame.size.height;
+        if desired.x < frame.origin.x
+            || desired.x >= frame.origin.x + frame.size.width
+            || desired.y < top
+            || desired.y >= top + frame.size.height
+        {
+            continue;
+        }
+        let visible = screen.visibleFrame();
+        let visible = CGRect::new(
+            CGPoint::new(
+                visible.origin.x,
+                primary_top - visible.origin.y - visible.size.height,
+            ),
+            visible.size,
+        );
+        let fitted = fit_position(desired, CGSize::new(rule.width, rule.height), visible);
+        // Explicit coordinates remain authoritative, including multi-screen layouts.
+        return CGPoint::new(rule.x.unwrap_or(fitted.x), rule.y.unwrap_or(fitted.y));
+    }
+    desired
 }
 
 #[cfg(test)]
@@ -601,6 +820,59 @@ mod tests {
                 .unwrap()
                 .contains_key("com.apple.finder")
         );
+    }
+
+    #[test]
+    fn growing_windows_move_only_when_the_target_would_cross_screen_edges() {
+        let visible = CGRect::new(CGPoint::new(0.0, 33.0), CGSize::new(1728.0, 1026.0));
+        let target = CGSize::new(1400.0, 985.0);
+        assert_eq!(
+            fit_position(CGPoint::new(357.0, 170.0), target, visible),
+            CGPoint::new(327.0, 73.0)
+        );
+        let fitting = CGPoint::new(100.0, 50.0);
+        assert_eq!(fit_position(fitting, target, visible), fitting);
+        let secondary = CGRect::new(CGPoint::new(-1920.0, -200.0), CGSize::new(1920.0, 1080.0));
+        assert_eq!(
+            fit_position(CGPoint::new(-500.0, 300.0), target, secondary),
+            CGPoint::new(-1401.0, -106.0)
+        );
+        // An oversized request must not panic from an inverted clamp interval.
+        assert_eq!(
+            fit_position(fitting, CGSize::new(3000.0, 2000.0), visible),
+            CGPoint::new(1.0, 34.0)
+        );
+    }
+
+    #[test]
+    fn startup_recovery_is_bounded_and_does_not_include_preexisting_apps() {
+        let now = Instant::now();
+        let launch = StartupRecovery::new(true, now);
+        assert!(launch.launched && launch.active(now + Duration::from_millis(200)));
+        assert!(!launch.active(now + Duration::from_secs(5)));
+        let existing = StartupRecovery::new(false, now);
+        assert!(existing.active(now));
+        assert!(!existing.launched);
+    }
+
+    #[test]
+    fn startup_snapshot_and_creation_event_share_one_resize_claim() {
+        let mut windows = CreatedWindows {
+            entries: Vec::new(),
+        };
+        // Recovery sees a window before it becomes main; creation arrives later.
+        windows.remember(1);
+        windows.remember(1);
+        assert_eq!(windows.entries.len(), 1);
+        assert!(windows.claim(&1));
+        // A later snapshot or notification must preserve a user's manual resize.
+        windows.remember(1);
+        assert!(!windows.claim(&1));
+        // This must work in the opposite event order too.
+        windows.remember(2);
+        assert!(windows.claim(&2));
+        windows.remember(2);
+        assert!(!windows.claim(&2));
     }
 
     #[test]
