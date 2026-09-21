@@ -1,0 +1,12 @@
+# 修改后需重新编译；本文件直接嵌入二进制，运行时不读取。
+[com.apple.finder]
+width = 860
+height = 660
+# x = 434
+# y = 218
+
+[com.apple.systempreferences]
+width = 740
+height = 648
+x = 494
+y = 223
