@@ -46,25 +46,33 @@ struct Rule {
 
 fn parse_config(source: &str) -> Result<Config, String> {
     // TOML treats [com.apple.finder] as nested tables. Flatten their paths into bundle IDs.
+    // A shorter ID may contain both rule fields and a longer ID nested beneath it.
     fn collect(table: toml::Table, path: String, rules: &mut Config) -> Result<(), String> {
-        if !table.is_empty() && table.values().all(toml::Value::is_table) {
-            for (key, value) in table {
-                let child = if path.is_empty() {
-                    key
-                } else {
-                    format!("{path}.{key}")
-                };
-                let toml::Value::Table(table) = value else {
-                    unreachable!()
-                };
-                collect(table, child, rules)?;
+        let mut fields = toml::Table::new();
+        let mut nested = Vec::new();
+        for (key, value) in table {
+            if let toml::Value::Table(child) = value {
+                nested.push((key, child));
+            } else {
+                fields.insert(key, value);
             }
+        }
+        let prefix_only = fields.is_empty() && !nested.is_empty();
+        for (key, child) in nested {
+            let child_path = if path.is_empty() {
+                key
+            } else {
+                format!("{path}.{key}")
+            };
+            collect(child, child_path, rules)?;
+        }
+        if prefix_only {
             return Ok(());
         }
         if path.is_empty() || path.chars().any(char::is_whitespace) {
             return Err("expected [application.bundle.id] with width and height".into());
         }
-        let mut rule: Rule = toml::Value::Table(table)
+        let mut rule: Rule = toml::Value::Table(fields)
             .try_into()
             .map_err(|e| format!("{path}: {e}"))?;
         if !rule.width.is_finite()
@@ -792,6 +800,29 @@ mod tests {
             (safari.width, safari.x, safari.y),
             (1200.5, Some(-1400.0), Some(41.0))
         );
+    }
+
+    #[test]
+    fn a_bundle_id_prefix_stays_a_separate_rule() {
+        let source = "\
+[com.apple.Safari.WebApp.8147349F-F0ED-4A76-9E5E-662CCCA1929D]
+width = 900
+height = 700
+
+[com.apple.Safari]
+width = 1712
+height = 1004
+x = 8
+y = 41
+";
+        let config = parse_config(source).unwrap();
+        assert_eq!(config["com.apple.Safari"].width, 1712.0);
+        let web_app = &config["com.apple.Safari.WebApp.8147349F-F0ED-4A76-9E5E-662CCCA1929D"];
+        assert_eq!(
+            (web_app.width, web_app.height, web_app.x),
+            (900.0, 700.0, None)
+        );
+        assert_eq!(config.len(), 2);
     }
 
     #[test]
