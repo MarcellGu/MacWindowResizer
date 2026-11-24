@@ -31,6 +31,7 @@ use std::{
 };
 
 const EMBEDDED_CONFIG: &str = include_str!("../config.toml");
+const FILL_MARGIN: f64 = 8.0;
 type Config = BTreeMap<String, Rule>;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -38,8 +39,10 @@ type Config = BTreeMap<String, Rule>;
 struct Rule {
     #[serde(skip)]
     bundle_id: String,
-    width: f64,
-    height: f64,
+    #[serde(default)]
+    fill: bool,
+    width: Option<f64>,
+    height: Option<f64>,
     x: Option<f64>,
     y: Option<f64>,
 }
@@ -70,15 +73,22 @@ fn parse_config(source: &str) -> Result<Config, String> {
             return Ok(());
         }
         if path.is_empty() || path.chars().any(char::is_whitespace) {
-            return Err("expected [application.bundle.id] with width and height".into());
+            return Err(
+                "expected [application.bundle.id] with width and height or fill = true".into(),
+            );
         }
         let mut rule: Rule = toml::Value::Table(fields)
             .try_into()
             .map_err(|e| format!("{path}: {e}"))?;
-        if !rule.width.is_finite()
-            || rule.width <= 0.0
-            || !rule.height.is_finite()
-            || rule.height <= 0.0
+        if !rule.fill && (rule.width.is_none() || rule.height.is_none()) {
+            return Err(format!(
+                "{path}: width and height are required unless fill = true"
+            ));
+        }
+        if [rule.width, rule.height]
+            .into_iter()
+            .flatten()
+            .any(|n| !n.is_finite() || n <= 0.0)
         {
             return Err(format!(
                 "{path}: width and height must be finite and positive"
@@ -578,11 +588,26 @@ impl WindowContext {
         if boolean_attribute(window, "AXFullScreen") || boolean_attribute(window, "AXMinimized") {
             return;
         }
-        // Move only as far as necessary before growing a window, otherwise AppKit
-        // can report success while clamping AXSize to the remaining screen space.
-        let position = point_attribute(window, "AXPosition")
-            .map(|position| resize_position(position, &self.rule));
-        let mut size = CGSize::new(self.rule.width, self.rule.height);
+        let old_position = point_attribute(window, "AXPosition");
+        let old_size = if self.rule.fill {
+            size_attribute(window)
+        } else {
+            None
+        };
+        let (position, target_size) =
+            match resize_target(&self.rule, old_position, old_size, &screen_areas()) {
+                Ok(target) => target,
+                Err(error) => {
+                    eprintln!(
+                        "MacWindowResizer: {}: {error}; skipped",
+                        self.rule.bundle_id
+                    );
+                    return;
+                }
+            };
+        // Move before growing a window, otherwise AppKit can report success while
+        // clamping AXSize to the remaining screen space.
+        let mut size = target_size;
         // SAFETY: size points to a correctly aligned CGSize for AXValueType::CGSize.
         let Some(size) =
             (unsafe { AXValue::new(AXValueType::CGSize, NonNull::from(&mut size).cast()) })
@@ -618,7 +643,7 @@ impl WindowContext {
             }
         }
         match size_attribute(window) {
-            Some(actual) if actual == CGSize::new(self.rule.width, self.rule.height) => {
+            Some(actual) if actual == target_size => {
                 eprintln!(
                     "MacWindowResizer: applied {} × {} to {} window",
                     actual.width, actual.height, self.rule.bundle_id
@@ -626,7 +651,11 @@ impl WindowContext {
             }
             Some(actual) => eprintln!(
                 "MacWindowResizer: {} requested {} × {}, actual {} × {}",
-                self.rule.bundle_id, self.rule.width, self.rule.height, actual.width, actual.height
+                self.rule.bundle_id,
+                target_size.width,
+                target_size.height,
+                actual.width,
+                actual.height
             ),
             None => eprintln!(
                 "MacWindowResizer: {} could not verify window size",
@@ -743,40 +772,122 @@ fn fit_position(position: CGPoint, size: CGSize, visible: CGRect) -> CGPoint {
     )
 }
 
-fn resize_position(old: CGPoint, rule: &Rule) -> CGPoint {
-    let desired = CGPoint::new(rule.x.unwrap_or(old.x), rule.y.unwrap_or(old.y));
+struct ScreenArea {
+    frame: CGRect,
+    visible: CGRect,
+}
+
+fn ax_rect(frame: CGRect, primary_top: f64) -> CGRect {
+    // NSScreen uses bottom-left coordinates; AX uses the primary screen's top-left.
+    CGRect::new(
+        CGPoint::new(
+            frame.origin.x,
+            primary_top - frame.origin.y - frame.size.height,
+        ),
+        frame.size,
+    )
+}
+
+fn screen_areas() -> Vec<ScreenArea> {
     let Some(main_thread) = MainThreadMarker::new() else {
-        return desired;
+        return Vec::new();
     };
     let screens = NSScreen::screens(main_thread);
     let Some(primary) = screens.firstObject() else {
-        return desired;
+        return Vec::new();
     };
-    // NSScreen uses bottom-left coordinates; AX uses the primary screen's top-left.
     let primary_top = primary.frame().origin.y + primary.frame().size.height;
-    for screen in &screens {
-        let frame = screen.frame();
-        let top = primary_top - frame.origin.y - frame.size.height;
-        if desired.x < frame.origin.x
-            || desired.x >= frame.origin.x + frame.size.width
-            || desired.y < top
-            || desired.y >= top + frame.size.height
-        {
-            continue;
+    // Read visibleFrame for each resize so Dock/menu-bar changes take effect.
+    screens
+        .iter()
+        .map(|screen| ScreenArea {
+            frame: ax_rect(screen.frame(), primary_top),
+            visible: ax_rect(screen.visibleFrame(), primary_top),
+        })
+        .collect()
+}
+
+fn contains_point(frame: CGRect, point: CGPoint) -> bool {
+    point.x >= frame.origin.x
+        && point.x < frame.origin.x + frame.size.width
+        && point.y >= frame.origin.y
+        && point.y < frame.origin.y + frame.size.height
+}
+
+fn window_screen(
+    position: CGPoint,
+    size: Option<CGSize>,
+    screens: &[ScreenArea],
+) -> Option<&ScreenArea> {
+    let mut best = None;
+    let mut best_area = 0.0;
+    if let Some(size) = size {
+        for screen in screens {
+            let frame = screen.frame;
+            let width = ((position.x + size.width).min(frame.origin.x + frame.size.width)
+                - position.x.max(frame.origin.x))
+            .max(0.0);
+            let height = ((position.y + size.height).min(frame.origin.y + frame.size.height)
+                - position.y.max(frame.origin.y))
+            .max(0.0);
+            let area = width * height;
+            if area > best_area {
+                best = Some(screen);
+                best_area = area;
+            }
         }
-        let visible = screen.visibleFrame();
-        let visible = CGRect::new(
-            CGPoint::new(
-                visible.origin.x,
-                primary_top - visible.origin.y - visible.size.height,
-            ),
-            visible.size,
-        );
-        let fitted = fit_position(desired, CGSize::new(rule.width, rule.height), visible);
-        // Explicit coordinates remain authoritative, including multi-screen layouts.
-        return CGPoint::new(rule.x.unwrap_or(fitted.x), rule.y.unwrap_or(fitted.y));
     }
-    desired
+    best.or_else(|| {
+        screens
+            .iter()
+            .find(|screen| contains_point(screen.frame, position))
+    })
+}
+
+fn resize_target(
+    rule: &Rule,
+    old_position: Option<CGPoint>,
+    old_size: Option<CGSize>,
+    screens: &[ScreenArea],
+) -> Result<(Option<CGPoint>, CGSize), &'static str> {
+    if rule.fill {
+        let position = old_position.ok_or("cannot read window position for fill")?;
+        let visible = window_screen(position, old_size, screens)
+            .ok_or("cannot determine the window's screen for fill")?
+            .visible;
+        let size = CGSize::new(
+            visible.size.width - 2.0 * FILL_MARGIN,
+            visible.size.height - 2.0 * FILL_MARGIN,
+        );
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return Err("screen's available area is too small for fill margins");
+        }
+        return Ok((
+            Some(CGPoint::new(
+                visible.origin.x + FILL_MARGIN,
+                visible.origin.y + FILL_MARGIN,
+            )),
+            size,
+        ));
+    }
+
+    let size = CGSize::new(
+        rule.width.ok_or("missing fixed width")?,
+        rule.height.ok_or("missing fixed height")?,
+    );
+    let position = old_position.map(|old| {
+        let desired = CGPoint::new(rule.x.unwrap_or(old.x), rule.y.unwrap_or(old.y));
+        let Some(screen) = screens
+            .iter()
+            .find(|screen| contains_point(screen.frame, desired))
+        else {
+            return desired;
+        };
+        let fitted = fit_position(desired, size, screen.visible);
+        // Explicit coordinates remain authoritative for fixed-size rules.
+        CGPoint::new(rule.x.unwrap_or(fitted.x), rule.y.unwrap_or(fitted.y))
+    });
+    Ok((position, size))
 }
 
 #[cfg(test)]
@@ -793,12 +904,12 @@ mod tests {
         let finder = &config["com.apple.finder"];
         assert_eq!(
             (finder.width, finder.height, finder.x, finder.y),
-            (860.0, 660.0, None, None)
+            (Some(860.0), Some(660.0), None, None)
         );
         let safari = &config["com.apple.Safari"];
         assert_eq!(
             (safari.width, safari.x, safari.y),
-            (1200.5, Some(-1400.0), Some(41.0))
+            (Some(1200.5), Some(-1400.0), Some(41.0))
         );
     }
 
@@ -816,11 +927,11 @@ x = 8
 y = 41
 ";
         let config = parse_config(source).unwrap();
-        assert_eq!(config["com.apple.Safari"].width, 1712.0);
+        assert_eq!(config["com.apple.Safari"].width, Some(1712.0));
         let web_app = &config["com.apple.Safari.WebApp.8147349F-F0ED-4A76-9E5E-662CCCA1929D"];
         assert_eq!(
             (web_app.width, web_app.height, web_app.x),
-            (900.0, 700.0, None)
+            (Some(900.0), Some(700.0), None)
         );
         assert_eq!(config.len(), 2);
     }
@@ -850,6 +961,156 @@ y = 41
             parse_config(&FINDER.replace("[com.apple.finder]", "[\"com.apple.finder\"]"))
                 .unwrap()
                 .contains_key("com.apple.finder")
+        );
+    }
+
+    #[test]
+    fn fill_is_optional_and_can_keep_fixed_settings_for_later() {
+        let config = parse_config("[com.apple.finder]\nfill = true").unwrap();
+        let rule = &config["com.apple.finder"];
+        assert!(rule.fill);
+        assert_eq!((rule.width, rule.height), (None, None));
+
+        let source = format!("{FINDER}fill = true\nx = 100\ny = 200");
+        let config = parse_config(&source).unwrap();
+        let rule = &config["com.apple.finder"];
+        assert_eq!(
+            (rule.width, rule.height, rule.x, rule.y),
+            (Some(860.0), Some(660.0), Some(100.0), Some(200.0))
+        );
+        let config = parse_config(&source.replace("fill = true", "fill = false")).unwrap();
+        assert!(!config["com.apple.finder"].fill);
+        assert!(!parse_config(FINDER).unwrap()["com.apple.finder"].fill);
+        for source in [
+            "[com.apple.finder]\nfill = false",
+            "[com.apple.finder]\nfill = 1",
+            "[com.apple.finder]\nfill = true\nwidth = nan",
+            "[com.apple.finder]\nfill = true\nheight = -1",
+        ] {
+            assert!(parse_config(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn fill_insets_available_area_by_eight_points_for_each_dock_position() {
+        let config = parse_config(&format!("{FINDER}fill = true\nx = -1800\ny = -500")).unwrap();
+        let rule = &config["com.apple.finder"];
+        for (visible, expected) in [
+            // Bottom Dock, then left Dock, then right Dock. The menu bar is 33 pt.
+            ((0.0, 33.0, 1728.0, 1004.0), (8.0, 41.0, 1712.0, 988.0)),
+            ((80.0, 33.0, 1648.0, 1084.0), (88.0, 41.0, 1632.0, 1068.0)),
+            ((0.0, 33.0, 1648.0, 1084.0), (8.0, 41.0, 1632.0, 1068.0)),
+        ] {
+            let screens = [ScreenArea {
+                frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1728.0, 1117.0)),
+                visible: CGRect::new(
+                    CGPoint::new(visible.0, visible.1),
+                    CGSize::new(visible.2, visible.3),
+                ),
+            }];
+            assert_eq!(
+                resize_target(
+                    rule,
+                    Some(CGPoint::new(500.0, 200.0)),
+                    Some(CGSize::new(900.0, 700.0)),
+                    &screens
+                ),
+                Ok((
+                    Some(CGPoint::new(expected.0, expected.1)),
+                    CGSize::new(expected.2, expected.3)
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn fill_uses_the_screen_with_most_of_the_window_including_negative_coordinates() {
+        let config = parse_config("[com.apple.finder]\nfill = true").unwrap();
+        let rule = &config["com.apple.finder"];
+        let screens = [
+            ScreenArea {
+                frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1920.0, 1080.0)),
+                visible: CGRect::new(CGPoint::new(0.0, 24.0), CGSize::new(1920.0, 1000.0)),
+            },
+            ScreenArea {
+                frame: CGRect::new(CGPoint::new(-1920.0, -200.0), CGSize::new(1920.0, 1080.0)),
+                visible: CGRect::new(CGPoint::new(-1920.0, -176.0), CGSize::new(1920.0, 1056.0)),
+            },
+        ];
+        // Its top-left is on the left display, but most of the window is on the primary.
+        assert_eq!(
+            resize_target(
+                rule,
+                Some(CGPoint::new(-100.0, 100.0)),
+                Some(CGSize::new(900.0, 700.0)),
+                &screens
+            ),
+            Ok((Some(CGPoint::new(8.0, 32.0)), CGSize::new(1904.0, 984.0)))
+        );
+        // Even with its top-left off-screen, the intersecting display can be found.
+        assert_eq!(
+            resize_target(
+                rule,
+                Some(CGPoint::new(-2000.0, -100.0)),
+                Some(CGSize::new(900.0, 700.0)),
+                &screens
+            ),
+            Ok((
+                Some(CGPoint::new(-1912.0, -168.0)),
+                CGSize::new(1904.0, 1040.0)
+            ))
+        );
+        // If AXSize is unavailable, the current position still selects the display.
+        assert_eq!(
+            resize_target(rule, Some(CGPoint::new(-1500.0, -100.0)), None, &screens),
+            Ok((
+                Some(CGPoint::new(-1912.0, -168.0)),
+                CGSize::new(1904.0, 1040.0)
+            ))
+        );
+        assert!(resize_target(rule, None, None, &screens).is_err());
+        assert!(resize_target(rule, Some(CGPoint::new(100.0, 100.0)), None, &[]).is_err());
+    }
+
+    #[test]
+    fn appkit_frames_convert_to_ax_coordinates_for_stacked_screens() {
+        assert_eq!(
+            ax_rect(
+                CGRect::new(CGPoint::new(0.0, 80.0), CGSize::new(1728.0, 1004.0)),
+                1117.0
+            ),
+            CGRect::new(CGPoint::new(0.0, 33.0), CGSize::new(1728.0, 1004.0))
+        );
+        assert_eq!(
+            ax_rect(
+                CGRect::new(CGPoint::new(-1920.0, 1117.0), CGSize::new(1920.0, 1080.0)),
+                1117.0
+            ),
+            CGRect::new(CGPoint::new(-1920.0, -1080.0), CGSize::new(1920.0, 1080.0))
+        );
+    }
+
+    #[test]
+    fn fixed_rules_keep_dimensions_and_explicit_coordinates() {
+        let config = parse_config(&format!("{FINDER}fill = false\nx = 1600\ny = 900")).unwrap();
+        let rule = &config["com.apple.finder"];
+        let screens = [ScreenArea {
+            frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1920.0, 1080.0)),
+            visible: CGRect::new(CGPoint::new(0.0, 24.0), CGSize::new(1920.0, 1000.0)),
+        }];
+        assert_eq!(
+            resize_target(rule, Some(CGPoint::new(100.0, 100.0)), None, &screens),
+            Ok((Some(CGPoint::new(1600.0, 900.0)), CGSize::new(860.0, 660.0)))
+        );
+        assert_eq!(
+            resize_target(rule, None, None, &[]),
+            Ok((None, CGSize::new(860.0, 660.0)))
+        );
+        let config = parse_config(FINDER).unwrap();
+        let rule = &config["com.apple.finder"];
+        assert_eq!(
+            resize_target(rule, Some(CGPoint::new(1600.0, 900.0)), None, &screens),
+            Ok((Some(CGPoint::new(1059.0, 363.0)), CGSize::new(860.0, 660.0)))
         );
     }
 
